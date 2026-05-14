@@ -1,0 +1,19 @@
+{
+  "name": "anclas-line-bot",
+  "version": "1.0.0",
+  "description": "福岡J・アンクラス 秘書AI LINE Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@line/bot-sdk": "^7.5.2",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  }
+}
