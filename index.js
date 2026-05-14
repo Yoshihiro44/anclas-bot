@@ -1,92 +1,260 @@
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env'), override: true });
 
-const express = require('express');
+const express   = require('express');
 const { Client, middleware } = require('@line/bot-sdk');
 const Anthropic = require('@anthropic-ai/sdk');
+const { addTask, listTasks }              = require('./notion');
+const { getCalendarEvents, addCalendarEvent } = require('./calendar');
 
-// ── 設定 ──────────────────────────────────────────
+// ── 設定 ──────────────────────────────────────────────────────────
 const lineConfig = {
   channelSecret:      process.env.LINE_CHANNEL_SECRET,
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
 };
 
-const lineClient  = new Client(lineConfig);
-const anthropic   = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const app         = express();
+const lineClient = new Client(lineConfig);
+const anthropic  = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const app        = express();
 
-const SYSTEM_PROMPT = `あなたは福岡J・アンクラスの優秀な秘書AIです。
-選手管理・クラブ運営・スポンサー営業・試合運営・アカデミー・経理・契約に関する質問に的確に答えてください。
-回答は簡潔かつ実用的にまとめ、必要であれば箇条書きや番号付きリストを使ってください。
-不明な点は「確認が必要です」と正直に伝えてください。`;
+// ── システムプロンプト ─────────────────────────────────────────────
+const BASE_PROMPT = `あなたは福岡Jアンクラス（女子サッカークラブ）のフロント統括責任者・Yoshihiro Matsuzakaの専属AI秘書です。
 
-// ユーザーごとの会話履歴（最大10往復）
-const histories = new Map();
-const MAX_HISTORY = 10;
+【Yoshiの主な業務】
+- クラブ全体のフロント運営統括
+- 試合運営の企画・実行管理
+- スポンサー営業・提案・契約管理
+- 対外交渉・提携先とのやり取り
+- クラブ経営改善
+- アカデミーサポート
+- ホームタウン事業
+- 経理・各種支払い
 
-// ── Webhook エンドポイント ──────────────────────────
+【あなたの役割】
+1. 試合運営：当日オペレーション・スタッフ配置・タイムライン作成
+2. スポンサー営業：提案書・営業メール・トークスクリプト即作成
+3. スポンサー管理：契約内容・露出管理・お礼メール文案
+4. 対外交渉：メール・提案文の下書き作成
+5. クラブ経営の壁打ち・アイデア出し
+
+【ツール使用の判断基準】
+- 「タスク追加して」「メモして」「登録して」→ notion_add_task を使う
+- 「タスク確認」「今日のタスク」「何があった」→ notion_list_tasks を使う
+- 「予定確認」「スケジュール」「来週何がある」→ calendar_get_events を使う
+- 「予定追加」「カレンダーに入れて」→ calendar_add_event を使う
+- その他（メール文面・企画書・相談）→ ツールを使わずそのまま回答
+
+【回答ルール】
+- 結論ファースト
+- 文章・テンプレはすぐ出す
+- 具体的・実用的
+- 簡潔に、使えるものをすぐ出す`;
+
+function getSystemPrompt() {
+  const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  return `[現在日時: ${now}]\n\n${BASE_PROMPT}`;
+}
+
+// ── Tool 定義（認証情報が設定されていれば有効化）─────────────────
+function getTools() {
+  const tools = [];
+
+  if (process.env.NOTION_API_KEY) {
+    tools.push(
+      {
+        name: 'notion_add_task',
+        description: 'Notionのタスク管理DBにタスクを追加する。タスク登録・メモ・TODO追加の依頼に使う。',
+        input_schema: {
+          type: 'object',
+          properties: {
+            title:    { type: 'string', description: 'タスクのタイトル（具体的に記述）' },
+            category: {
+              type: 'string',
+              enum: ['ユニフォーム', 'イベント・MT', 'グッズ・販売', '選手サポート', '営業・提携', 'その他'],
+              description: 'タスクカテゴリ。内容から適切なものを選ぶ',
+            },
+            due_date: { type: 'string', description: '期限日 YYYY-MM-DD。不明・未指定なら省略' },
+          },
+          required: ['title', 'category'],
+        },
+      },
+      {
+        name: 'notion_list_tasks',
+        description: 'Notionから未完了のアンクラスタスク一覧を取得する。タスク確認・進捗チェックに使う。',
+        input_schema: {
+          type: 'object',
+          properties: {
+            limit: { type: 'number', description: '取得件数（デフォルト10、最大20）' },
+          },
+        },
+      }
+    );
+  }
+
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_KEY) {
+    tools.push(
+      {
+        name: 'calendar_get_events',
+        description: 'Google Calendarから今後の予定一覧を取得する。スケジュール確認・予定チェックに使う。',
+        input_schema: {
+          type: 'object',
+          properties: {
+            days: { type: 'number', description: '何日先まで取得するか（デフォルト7）' },
+          },
+        },
+      },
+      {
+        name: 'calendar_add_event',
+        description: 'Google Calendarに予定を追加する。日程登録・スケジュール入力に使う。',
+        input_schema: {
+          type: 'object',
+          properties: {
+            title:       { type: 'string',  description: '予定のタイトル' },
+            start:       { type: 'string',  description: '開始日時 ISO 8601形式（例: 2025-05-20T14:00:00+09:00）' },
+            end:         { type: 'string',  description: '終了日時 ISO 8601形式' },
+            description: { type: 'string',  description: '詳細・メモ（任意）' },
+          },
+          required: ['title', 'start', 'end'],
+        },
+      }
+    );
+  }
+
+  return tools;
+}
+
+// ── Tool 実行 ─────────────────────────────────────────────────────
+async function executeTool(name, input) {
+  console.log(`[Tool] ${name}`, JSON.stringify(input));
+  try {
+    switch (name) {
+      case 'notion_add_task':     return await addTask(input);
+      case 'notion_list_tasks':   return await listTasks(input);
+      case 'calendar_get_events': return await getCalendarEvents(input);
+      case 'calendar_add_event':  return await addCalendarEvent(input);
+      default: return { error: `未知のツール: ${name}` };
+    }
+  } catch (err) {
+    console.error(`[Tool error: ${name}]`, err.message);
+    return { error: err.message };
+  }
+}
+
+// ── Claude アジェンティックループ ────────────────────────────────
+async function askClaude(messages, tools) {
+  const MAX_LOOPS = 6;
+  const localMsgs = [...messages];
+
+  for (let i = 0; i < MAX_LOOPS; i++) {
+    const params = {
+      model:      'claude-sonnet-4-6',
+      max_tokens: 2048,
+      system:     getSystemPrompt(),
+      messages:   localMsgs,
+    };
+    if (tools.length > 0) params.tools = tools;
+
+    const res = await anthropic.messages.create(params);
+    localMsgs.push({ role: 'assistant', content: res.content });
+
+    // ツール呼び出しがなければ終了
+    if (res.stop_reason !== 'tool_use') {
+      const text = res.content.find(b => b.type === 'text');
+      return text?.text ?? '処理が完了しました。';
+    }
+
+    // ツール実行 → 結果をメッセージに追加
+    const results = [];
+    for (const block of res.content) {
+      if (block.type !== 'tool_use') continue;
+      const result = await executeTool(block.name, block.input);
+      results.push({
+        type:        'tool_result',
+        tool_use_id: block.id,
+        content:     JSON.stringify(result, null, 2),
+      });
+    }
+    localMsgs.push({ role: 'user', content: results });
+  }
+
+  return 'リクエストの処理に時間がかかりました。もう一度お試しください。';
+}
+
+// ── 会話履歴管理（テキスト往復のみ保存）─────────────────────────
+const histories    = new Map();
+const MAX_HISTORY  = 8; // 最大8往復
+
+// ── Webhook ───────────────────────────────────────────────────────
 app.post('/webhook', middleware(lineConfig), (req, res) => {
-  // LINE には即座に 200 を返す（タイムアウト防止）
-  res.sendStatus(200);
-
-  Promise.all(req.body.events.map(handleEvent)).catch(err =>
-    console.error('[handleEvent error]', err)
+  res.sendStatus(200); // LINE には即時 200
+  Promise.all(req.body.events.map(handleEvent)).catch(e =>
+    console.error('[webhook error]', e)
   );
 });
 
-// ── ヘルスチェック（Railway の確認用）──────────────
-app.get('/', (_, res) => res.send('アンクラス秘書 Bot is running.'));
+// ヘルスチェック
+app.get('/', (_, res) => {
+  const tools = getTools().map(t => t.name);
+  res.json({
+    status:  'running',
+    tools:   tools.length ? tools : ['none (AI chat only)'],
+    time:    new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }),
+  });
+});
 
-// ── イベントハンドラ ───────────────────────────────
+// ── イベントハンドラ ──────────────────────────────────────────────
 async function handleEvent(event) {
-  // テキストメッセージ以外は無視
   if (event.type !== 'message' || event.message.type !== 'text') return;
 
   const userId  = event.source.userId;
   const userMsg = event.message.text.trim();
 
-  // 会話履歴を取得・更新
   if (!histories.has(userId)) histories.set(userId, []);
   const history = histories.get(userId);
 
-  history.push({ role: 'user', content: userMsg });
+  const messages = [...history, { role: 'user', content: userMsg }];
+  const tools    = getTools();
 
-  // 最大件数を超えたら古い方から2件（1往復）削除
-  while (history.length > MAX_HISTORY * 2) history.splice(0, 2);
-
-  let replyText;
+  let reply;
   try {
-    const response = await anthropic.messages.create({
-      model:      'claude-sonnet-4-6',
-      max_tokens: 1024,
-      system:     SYSTEM_PROMPT,
-      messages:   history,
-    });
+    reply = await askClaude(messages, tools);
 
-    replyText = response.content[0].text;
-    history.push({ role: 'assistant', content: replyText });
+    // 履歴を更新（テキストのみ）
+    history.push(
+      { role: 'user',      content: userMsg },
+      { role: 'assistant', content: reply   },
+    );
+    while (history.length > MAX_HISTORY * 2) history.splice(0, 2);
 
   } catch (err) {
-    console.error('[Claude API error]', err);
-    replyText = '申し訳ありません、現在応答できない状態です。しばらくしてから再度お試しください。';
-    // エラー時は履歴に残さない（最後のユーザー発言も取り消し）
-    history.pop();
+    console.error('[askClaude error]', err);
+    reply = '申し訳ありません、エラーが発生しました。もう一度お試しください。';
   }
 
+  // LINE の文字数上限（5000字）を超える場合は分割して送信
+  const chunks = chunkText(reply, 4500);
   try {
-    await lineClient.replyMessage(event.replyToken, {
-      type: 'text',
-      text: replyText,
-    });
+    await lineClient.replyMessage(event.replyToken, { type: 'text', text: chunks[0] });
+    for (let i = 1; i < chunks.length; i++) {
+      await lineClient.pushMessage(userId, { type: 'text', text: chunks[i] });
+    }
   } catch (err) {
     console.error('[LINE reply error]', err);
   }
 }
 
-// ── サーバー起動 ───────────────────────────────────
+function chunkText(text, max) {
+  if (text.length <= max) return [text];
+  const out = [];
+  for (let i = 0; i < text.length; i += max) out.push(text.slice(i, i + max));
+  return out;
+}
+
+// ── 起動 ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ アンクラス秘書 Bot 起動 — port ${PORT}`);
-  if (!process.env.LINE_CHANNEL_SECRET)      console.warn('⚠️  LINE_CHANNEL_SECRET が未設定です');
-  if (!process.env.LINE_CHANNEL_ACCESS_TOKEN) console.warn('⚠️  LINE_CHANNEL_ACCESS_TOKEN が未設定です');
-  if (!process.env.ANTHROPIC_API_KEY)         console.warn('⚠️  ANTHROPIC_API_KEY が未設定です');
+  console.log(`✅ アンクラス秘書 Bot — port ${PORT}`);
+  const required = ['LINE_CHANNEL_SECRET', 'LINE_CHANNEL_ACCESS_TOKEN', 'ANTHROPIC_API_KEY'];
+  required.forEach(k => { if (!process.env[k]) console.warn(`⚠️  ${k} 未設定`); });
+  const tools = getTools();
+  console.log('🔧 有効なツール:', tools.length ? tools.map(t => t.name).join(', ') : 'なし（AI応答のみ）');
 });
