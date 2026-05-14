@@ -258,6 +258,8 @@ function chunkText(text, max) {
 
 // ── 起動 ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
+app.get("/", (req, res) => res.send("OK"));
+
 app.listen(PORT, () => {
   console.log(`✅ アンクラス秘書 Bot — port ${PORT}`);
   const required = ['LINE_CHANNEL_SECRET', 'LINE_CHANNEL_ACCESS_TOKEN', 'ANTHROPIC_API_KEY'];
