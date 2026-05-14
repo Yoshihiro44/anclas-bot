@@ -1,6 +1,6 @@
 const { Client } = require('@notionhq/client');
 
-const notion = new Client({ auth: process.env.NOTION_API_KEY });
+const notion = new Client({ auth: process.env.NOTION_API_KEY || process.env.NOTION_TOKEN });
 
 // CLAUDE.md に記載の DB ID をデフォルトとして使用
 const DB_ID = process.env.NOTION_DB_ID || '62a5c6769522437ebd9926a65eacb7b3';

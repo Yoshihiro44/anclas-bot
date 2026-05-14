@@ -58,7 +58,7 @@ function getSystemPrompt() {
 function getTools() {
   const tools = [];
 
-  if (process.env.NOTION_API_KEY) {
+  if (process.env.NOTION_API_KEY || process.env.NOTION_TOKEN) {
     tools.push(
       {
         name: 'notion_add_task',
